@@ -89,6 +89,37 @@ Linux 4.19.0-15-amd64 #1 SMP Debian 4.19.177-1 (2021-03-03) x86_64 GNU/Linux
 python(1) 3.7, unshare(1), cgroup(8) v1, mount(8), umount(8), pivot_root(8), ip(8), LIBC(7)
 ```
 
+### Context Manager
+
+Pish 使用 Python 的 [Context Manager](https://docs.python.org/3/reference/datamodel.html#with-statement-context-managers) 数据模型来管理容器环境的生命周期。
+
+Context Manager 是 Python 的一个特性，它可以在对象的生命周期中执行一些操作，比如在对象创建时执行一些操作，或者在对象销毁时执行一些操作。例如，现代 Python 中频繁使用的 `with open()` 语句就是使用了 Context Manager，它在进入 with 环境时打开文件，并在退出环境时关闭文件。
+
+在 Pish 中，Context Manager 用于在容器创建时执行一些操作，比如创建 Cgroup、创建网络等，以及在容器销毁时执行一些操作，比如删除 Cgroup、删除网络等。
+
+在完成了各种 Context Manager 封装之后，pish 最终启动容器代码只需要：声明环境，启动进程，加入管理，等待容器运行结束，清理环境。
+
+```py
+with OverlayFS(opts.image) as fs, \
+        Cgroup(opts.name) as cg, \
+        Network(opts.network) as net:
+    # namespace & the container process
+    cmd = subprocess.Popen(["unshare", ...,
+                            "container.py", ...])
+    # network
+    net.add_to_network(opts.name, opts.ip)
+    # cgroup
+    for r in opts.resource:
+        cg.set(*r.split("="))
+    cg.apply(cmd.pid)
+    
+    # 容器开始运行
+    cmd.wait()
+# 容器退出后: 自动清理 network, cgroup 和临时文件系统
+```
+
+Context Manager 的引入，使得 Pish 的代码更加简洁、清晰、易读。这也是 pish 较 hind 节省近 80% 代码、同时提供更丰富功能的原因之一。
+
 ### Cgroup
 
 Cgroup（Control Group）是一种用于限制和管理进程组资源的机制，它可以用于限制容器的资源使用。Cgroup通过为进程组提供一个层次结构的组织方式，允许对每个组别的资源进行限制、监控和统计。
