@@ -36,10 +36,6 @@ def main():
 
 
 def run(opts):
-    net = None
-    if opts.network and opts.network != "None" and opts.ip:
-        net = Network(opts.network)
-
     with OverlayFS(opts.image) as fs, \
             Cgroup("pish-" + opts.name) as cg, \
             Network(opts.network) as net:
@@ -154,7 +150,8 @@ class Network:
         try_run = partial(subprocess.run, check=False)
         for ns in self.netns:
             logging.info("network: deleting netns %s" % ns)
-            try_run(["ip", "netns", "exec", ns, "ip", "link", "set", "dev", "eth0", "down"])
+            try_run(["ip", "netns", "exec", ns, "ip",
+                    "link", "set", "dev", "eth0", "down"])
             try_run(["ip", "netns", "exec", ns, "ip", "link", "delete", "eth0"])
             try_run(["ip", "netns", "delete", ns])
             # first: Device or resource busy
@@ -164,7 +161,7 @@ class Network:
         for ns in self.netns:
             logging.info("network: deleting netns %s" % ns)
             try_run(["ip", "netns", "delete", ns])
-            # second: success delete, reason unknown 
+            # second: success delete, reason unknown
 
         logging.info("network: deleting bridge %s" % self.bridge)
         res = try_run(["ip", "link", "delete", self.bridge, "type", "bridge"])
@@ -197,8 +194,9 @@ class Network:
 
         subprocess.run(["ip", "link", "add", veth_container,
                        "type", "veth", "peer", "name", veth_host], check=True)
-        logging.info("network: created veth pair %s <=> %s" % (veth_container, veth_host))
-        
+        logging.info("network: created veth pair %s <=> %s" %
+                     (veth_container, veth_host))
+
         # self.vnets.add(veth_container) # peer: one is enough
         self.vnets.add(veth_host)
 
@@ -219,56 +217,6 @@ class Network:
                        "link", "set", "eth0", "up"], check=True)
 
         # TODO: set the route
-
-
-def __netns_memo(netns_name: str, ip: str):
-    """
-    # 1. 创建一个网桥
-
-    sudo ip link add br700 type bridge
-    sudo ip link set br700 up
-
-    # 2. 创建一个 veth pair: 连接 ns 和 host 的虚拟网线
-
-    # 700 给 ns 用，701 给 host 用
-    sudo ip link add veth700 type veth peer name veth701
-
-    # 3. 设置 ns 中的网络设备，分配 IP
-
-    sudo ip netns add netns70
-
-    sudo ip link set veth700 netns netns70
-    sudo ip netns exec netns70 ip link set dev veth700 name eth0
-    sudo ip netns exec netns70 ip addr add 10.0.0.2/24 dev eth0
-    sudo ip netns exec netns70 ip link set eth0 up
-
-    sudo ip netns exec netns70 ifconfig # 已经分配到网卡和 IP 了
-
-    # 4. host 作为网桥的一端，连接到 veth701
-
-    sudo ip link set veth701 master br700
-    sudo ip link set veth701 up
-
-    # 5. another container
-
-    sudo ip netns add netns71
-
-    sudo ip link set veth710 netns netns71
-    sudo ip netns exec netns71 ip link set dev veth710 name eth0
-    sudo ip netns exec netns71 ip addr add 10.0.0.3/24 dev eth0
-    sudo ip netns exec netns71 ip link set eth0 up
-
-    sudo ip netns exec netns71 ifconfig
-
-    sudo ip link set veth711 master br700
-    sudo ip link set veth711 up
-
-    # 两个容器互相连通了：
-
-    sudo ip netns exec netns71 ping 10.0.0.2
-    sudo ip netns exec netns70 ping 10.0.0.3
-    """
-    pass
 
 
 class Cgroup:
