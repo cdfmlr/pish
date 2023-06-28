@@ -1,8 +1,10 @@
 # pish: PISH Is a Simplified Hind
 
-Pish is yet another container runtime implementation..
-
 Pish is a rewrite of [cdfmlr/hind](https://github.com/cdfmlr/hind), focusing on simplicity and readability.
+
+![hind vs pish: The imperative architecture meets the declarative architecture](asset/hind-vs-pish.png)
+
+## Quick Look
 
 ```sh
 git clone github.com/cdfmlr/pish
