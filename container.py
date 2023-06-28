@@ -40,7 +40,7 @@ def run(opts):
 
 
 def pivot_root(new_root):
-    logging.info("pivot_root to %s" % new_root)
+    logging.info("container: pivot_root to %s" % new_root)
 
     os.mkdir(new_root + "/old_root")
 

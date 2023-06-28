@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from functools import partial
 
 
 def main():
@@ -15,8 +16,10 @@ def main():
     parser.add_argument("-n", "--name", required=False,
                         default=random_name(),
                         help="container id, default is random")
-    parser.add_argument("--network", required=False, default="None", help="a name for the network bridge: None for no network. Requires --ip.")
-    parser.add_argument("--ip", required=False, default="", help="an ip address for the container: None for no ip. Requires --network.")
+    parser.add_argument("--network", required=False, default="pishbridge",
+                        help="a name for the network bridge: Default is `pishbridge`.")
+    parser.add_argument("--ip", required=False, default="",
+                        help="an ip address for the container: None for no ip. Requires --network.")
     parser.add_argument("--resource", action="append", required=False, default=[],
                         help="resource to limit in `controller.key=value`. This option can be added multiple times.")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -37,125 +40,186 @@ def run(opts):
     if opts.network and opts.network != "None" and opts.ip:
         net = Network(opts.network)
 
-    with tempfile.TemporaryDirectory("-" + opts.name, "pish-") as tmp_dir:
-        root = overlayfs(tmp_dir, opts.image)
-        
-        unshare_net_opt = "--net"
-        if net:
-            ns = net.create_ns(opts.name)
-            unshare_net_opt += "=/var/run/netns/" + ns
-        
-        cmd = subprocess.Popen(["unshare", "-impuf", unshare_net_opt, 
+    with OverlayFS(opts.image) as fs, \
+            Cgroup("pish-" + opts.name) as cg, \
+            Network(opts.network) as net:
+        root = fs.merged
+
+        ns = net.create_ns(opts.name)
+        unshare_net_opt = "--net=/var/run/netns/" + ns
+
+        cmd = subprocess.Popen(["unshare", "-impuf", unshare_net_opt,
                                 "python3", "container.py",
                                 "--root", root, "-c", opts.command])
 
-        logging.info("container pid: %d" % cmd.pid)
+        logging.info("run: container pid: %d" % cmd.pid)
 
-        with Cgroup("pish-" + opts.name) as cg:
-            for r in opts.resource:
-                cg.set(*r.split("=")) # cg.set("memory.limit_in_bytes", "100m")
-            cg.apply(cmd.pid)
+        for r in opts.resource:
+            cg.set(*r.split("="))  # cg.set("memory.limit_in_bytes", "100m")
+        cg.apply(cmd.pid)
 
-            if net:
-                net.add_to_network(opts.name, opts.ip)
+        net.add_to_network(opts.name, opts.ip)
 
-            cmd.wait()
+        cmd.wait()
 
-        logging.info("container exited")
-
-        # unmount overlayfs before tmp_dir is removed
-        subprocess.run(["umount", root], check=True)
+        logging.info("run: container exited")
 
 
 def random_name():
     return "pish" + str(os.getpid()) + str(os.urandom(4).hex())
 
 
-def overlayfs(base: str, image: str) -> str:
-    lower = os.path.join(base, "lower")
-    if os.path.isdir(image):
-        logging.info("overlayfs: using directory %s as lower" % image)
-        lower = image
-    else:
-        logging.info("overlayfs: extracting image %s to %s" % (image, lower))
-        os.makedirs(lower)
-        subprocess.run(["tar", "-xf", image, "-C", lower], check=True)
+class OverlayFS:
+    def __init__(self, image_path: str):
+        self._tmp_dir = tempfile.TemporaryDirectory(None, "pish")
+        # base_path is the path to _tmp_dir
+        self.base_path = self._tmp_dir.__enter__()
+        self.image_path = image_path
 
-    upper = os.path.join(base, "upper")
-    os.makedirs(upper)
+        self.lower = None
+        self.upper = None
+        self.work = None
+        self.merged = None
 
-    work = os.path.join(base, "work")
-    os.makedirs(work)
+    def __enter__(self):
+        base = self.base_path
+        image = self.image_path
 
-    merged = os.path.join(base, "merged")
-    os.makedirs(merged)
+        lower = os.path.join(base, "lower")
+        if os.path.isdir(image):
+            logging.info("overlayfs: using directory %s as lower" % image)
+            lower = image
+        else:
+            logging.info("overlayfs: extracting image %s to %s" %
+                         (image, lower))
+            os.makedirs(lower)
+            subprocess.run(["tar", "-xf", image, "-C", lower], check=True)
 
-    # mount -t overlay overlay -o lowerdir=/lower,upperdir=/upper,workdir=/work /merged
-    subprocess.run(["mount", "-t", "overlay", "overlay",
-                    "-o", "lowerdir=%s,upperdir=%s,workdir=%s" % (
-                        lower, upper, work),
-                    merged], check=True)
+        upper = os.path.join(base, "upper")
+        os.makedirs(upper)
 
-    logging.info("overlayfs: mounted at %s" % merged)
+        work = os.path.join(base, "work")
+        os.makedirs(work)
 
-    return merged
+        merged = os.path.join(base, "merged")
+        os.makedirs(merged)
 
-# Network is a bridge
-# TODO: cleanup
+        # mount -t overlay overlay -o lowerdir=/lower,upperdir=/upper,workdir=/work /merged
+        subprocess.run(["mount", "-t", "overlay", "overlay",
+                        "-o", "lowerdir=%s,upperdir=%s,workdir=%s" % (
+                            lower, upper, work),
+                        merged], check=True)
+
+        logging.info("overlayfs: mounted at %s" % merged)
+
+        self.lower = lower
+        self.upper = upper
+        self.work = work
+        self.merged = merged
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        logging.info("overlayfs: unmounting %s" % self.merged)
+        subprocess.run(["umount", self.merged], check=True)
+
+        logging.info("overlayfs: remove tmp dir %s" % self.base_path)
+        self._tmp_dir.__exit__(exc_type, exc_value, traceback)
+
+
 class Network:
+    """Network is a bridge"""
+
     def __init__(self, name: str) -> None:
-        self.name = name
+        self.bridge = name
+
+        self.netns = set()
+        self.vnets = set()
 
         if not self._exists():
             self._create()
 
     def _exists(self) -> bool:
-        return os.path.exists("/sys/class/net/" + self.name)
-    
+        return os.path.exists("/sys/class/net/" + self.bridge)
+
     def _create(self):
-        subprocess.run(["ip", "link", "add", self.name, "type", "bridge"], check=True)
-        subprocess.run(["ip", "link", "set", self.name, "up"], check=True)
+        logging.info("network: creating bridge %s" % self.bridge)
+
+        subprocess.run(["ip", "link", "add", self.bridge,
+                       "type", "bridge"], check=True)
+        subprocess.run(["ip", "link", "set", self.bridge, "up"], check=True)
 
     def delete(self):
-        subprocess.run(["ip", "link", "delete", self.name, "type", "bridge"], check=True)
+        # just let it fail, i don't care
+        try_run = partial(subprocess.run, check=False)
+        for ns in self.netns:
+            logging.info("network: deleting netns %s" % ns)
+            try_run(["ip", "netns", "exec", ns, "ip", "link", "set", "dev", "eth0", "down"])
+            try_run(["ip", "netns", "exec", ns, "ip", "link", "delete", "eth0"])
+            try_run(["ip", "netns", "delete", ns])
+            # first: Device or resource busy
+        for vnet in self.vnets:
+            logging.info("network: deleting vnet %s" % vnet)
+            try_run(["ip", "link", "delete", vnet])
+        for ns in self.netns:
+            logging.info("network: deleting netns %s" % ns)
+            try_run(["ip", "netns", "delete", ns])
+            # second: success delete, reason unknown 
+
+        logging.info("network: deleting bridge %s" % self.bridge)
+        res = try_run(["ip", "link", "delete", self.bridge, "type", "bridge"])
 
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_value, traceback):
         self.delete()
 
     def create_ns(self, containerID: str) -> str:
         ns = "pishnetns-" + containerID
+
+        logging.info("network: creating netns %s" % ns)
         subprocess.run(["ip", "netns", "add", ns], check=True)
+
+        self.netns.add(ns)
         return ns
 
     def add_to_network(self, containerID: str, ip: str):
-        br = self.name
+        br = self.bridge
 
         veth_container = "pishveth-" + containerID + "0"
         veth_host = "pishveth-" + containerID + "1"
 
         ns = "pishnetns-" + containerID
 
-        logging.info("network: adding container %s to network %s (ip %s)" % (containerID, br, ip))
+        logging.info("network: adding container %s to network %s (ip %s)" % (
+            containerID, br, ip))
 
-        subprocess.run(["ip", "link", "add", veth_container, "type", "veth", "peer", "name", veth_host], check=True)
+        subprocess.run(["ip", "link", "add", veth_container,
+                       "type", "veth", "peer", "name", veth_host], check=True)
+        logging.info("network: created veth pair %s <=> %s" % (veth_container, veth_host))
         
+        # self.vnets.add(veth_container) # peer: one is enough
+        self.vnets.add(veth_host)
+
         # host side
-        subprocess.run(["ip", "link", "set", veth_host, "master", br], check=True)
+        subprocess.run(["ip", "link", "set", veth_host,
+                       "master", br], check=True)
         subprocess.run(["ip", "link", "set", veth_host, "up"], check=True)
-        
-        # container side
-        # subprocess.run(["ip", "netns", "add", ns], check=True)
 
-        subprocess.run(["ip", "link", "set", veth_container, "netns", ns], check=True)
-        subprocess.run(["ip", "netns", "exec", ns, "ip", "link", "set", veth_container, "name", "eth0"], check=True)
-        subprocess.run(["ip", "netns", "exec", ns, "ip", "addr", "add", ip, "dev", "eth0"], check=True)
-        subprocess.run(["ip", "netns", "exec", ns, "ip", "link", "set", "eth0", "up"], check=True)
+        # container side
+
+        subprocess.run(
+            ["ip", "link", "set", veth_container, "netns", ns], check=True)
+        subprocess.run(["ip", "netns", "exec", ns, "ip", "link",
+                       "set", veth_container, "name", "eth0"], check=True)
+        subprocess.run(["ip", "netns", "exec", ns, "ip", "addr",
+                       "add", ip, "dev", "eth0"], check=True)
+        subprocess.run(["ip", "netns", "exec", ns, "ip",
+                       "link", "set", "eth0", "up"], check=True)
 
         # TODO: set the route
-        
+
 
 def __netns_memo(netns_name: str, ip: str):
     """
@@ -170,7 +234,7 @@ def __netns_memo(netns_name: str, ip: str):
     sudo ip link add veth700 type veth peer name veth701
 
     # 3. 设置 ns 中的网络设备，分配 IP
-    
+
     sudo ip netns add netns70
 
     sudo ip link set veth700 netns netns70
@@ -206,6 +270,7 @@ def __netns_memo(netns_name: str, ip: str):
     """
     pass
 
+
 class Cgroup:
     def __init__(self, group_name: str, base_path="/sys/fs/cgroup") -> None:
         self.group = group_name
@@ -225,7 +290,7 @@ class Cgroup:
             os.makedirs(d)
 
         f = os.path.join(d, controller + "." + key)
-        logging.info("cgroup set: %s > %s" % (value, f))
+        logging.info("cgroup: set %s > %s" % (value, f))
         with open(f, "w") as f:
             f.write(str(value))
 
@@ -245,7 +310,7 @@ class Cgroup:
                 os.makedirs(d)
 
             f = os.path.join(d, "tasks")
-            logging.info("cgroup apply: %s > %s" % (pid, f))
+            logging.info("cgroup: apply %s > %s" % (pid, f))
             with open(f, "a") as f:
                 f.write(str(pid))
 
@@ -257,9 +322,9 @@ class Cgroup:
         pass
 
     def __del__(self):
+        logging.info("cgroup: deleting %s" % self.group)
         subprocess.run(["cgdelete", ",".join(
             self.controllers) + ":" + self.group])
-        logging.info("cgroup deleted: %s" % self.group)
 
 
 if __name__ == "__main__":
