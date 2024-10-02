@@ -34,9 +34,12 @@ def run(opts):
         raise OSError(ctypes.get_errno(), "mount /proc failed: " +
                       os.strerror(ctypes.get_errno()))
 
-    cmd = subprocess.Popen(opts.command)
+    logging.info("container: running command: %s", opts.command)
 
+    cmd = subprocess.Popen(opts.command)
     cmd.wait()
+
+    logging.info("container: command exits.")
 
 
 def pivot_root(new_root):

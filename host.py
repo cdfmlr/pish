@@ -39,24 +39,27 @@ def run(opts):
     with OverlayFS(opts.image) as fs, \
             Cgroup("pish-" + opts.name) as cg, \
             Network(opts.network) as net:
-        root = fs.merged
+        try:
+            root = fs.merged
 
-        ns = net.create_ns(opts.name)
-        unshare_net_opt = "--net=/var/run/netns/" + ns
+            ns = net.create_ns(opts.name)
+            unshare_net_opt = "--net=/var/run/netns/" + ns
 
-        cmd = subprocess.Popen(["unshare", "-impuf", unshare_net_opt,
-                                "python3", "container.py",
-                                "--root", root, "-c", opts.command])
+            cmd = subprocess.Popen(["unshare", "-impuf", unshare_net_opt,
+                                    "python3", "container.py",
+                                    "--root", root, "-c", opts.command])
 
-        logging.info("run: container pid: %d" % cmd.pid)
+            logging.info("run: container pid: %d" % cmd.pid)
 
-        for r in opts.resource:
-            cg.set(*r.split("="))  # cg.set("memory.limit_in_bytes", "100m")
-        cg.apply(cmd.pid)
+            for r in opts.resource:
+                cg.set(*r.split("="))  # cg.set("memory.limit_in_bytes", "100m")
+            cg.apply(cmd.pid)
 
-        net.add_to_network(opts.name, opts.ip)
+            net.add_to_network(opts.name, opts.ip)
 
-        cmd.wait()
+            cmd.wait()
+        except Exception as err:
+            logging.error("run: setup and run container error: %s" % err)
 
         logging.info("run: container exited")
 
@@ -155,9 +158,11 @@ class Network:
             try_run(["ip", "netns", "exec", ns, "ip", "link", "delete", "eth0"])
             try_run(["ip", "netns", "delete", ns])
             # first: Device or resource busy
+        logging.info("don't worrying about the \"Device or resource busy\" error above. This is expected.")
         for vnet in self.vnets:
             logging.info("network: deleting vnet %s" % vnet)
             try_run(["ip", "link", "delete", vnet])
+        logging.info("don't worrying about the \"Cannot find device\" error above. This is expected.")
         for ns in self.netns:
             logging.info("network: deleting netns %s" % ns)
             try_run(["ip", "netns", "delete", ns])
@@ -219,7 +224,7 @@ class Network:
         # TODO: set the route
 
 
-class Cgroup:
+class CgroupV1:
     def __init__(self, group_name: str, base_path="/sys/fs/cgroup") -> None:
         self.group = group_name
         self.base = base_path
@@ -273,6 +278,60 @@ class Cgroup:
         logging.info("cgroup: deleting %s" % self.group)
         subprocess.run(["cgdelete", ",".join(
             self.controllers) + ":" + self.group])
+
+
+class CgroupV2:
+    def __init__(self, group_name: str, base_path="/sys/fs/cgroup") -> None:
+        self.group = group_name
+        self.base = base_path
+
+        self.set("cgroup.subtree_control", "+cpu +memory")
+
+        self.set("cpuset.cpus", "0")
+        self.set("cpuset.mems", "0")
+
+        # https://unix.stackexchange.com/a/713343
+        self.base = os.path.join(self.base, self.group)
+
+    def set(self, key: str, value: str):
+        d = os.path.join(self.base, self.group)
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+        f = os.path.join(d, key)
+        logging.info("cgroup: set %s > %s" % (value, f))
+        with open(f, "w") as f:
+            f.write(str(value))
+
+    def get(self, key: str) -> str:
+        f = os.path.join(self.base, self.group, key)
+        with open(f, "r") as f:
+            return f.read()
+
+    def apply(self, pid: int):
+        d = os.path.join(self.base, self.group)
+        if not os.path.exists(d):  # never happens
+            os.makedirs(d)
+
+        f = os.path.join(d, "cgroup.procs")
+        logging.info("cgroup: apply %s > %s" % (pid, f))
+        with open(f, "a") as f:
+            f.write(str(pid))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # self.__del__()
+        pass
+
+    def __del__(self):
+        logging.info("cgroup: deleting %s" % self.group)
+        subprocess.run(["rmdir", os.path.join(self.base, self.group)])
+        subprocess.run(["rmdir", self.base])
+
+
+Cgroup = CgroupV2
 
 
 if __name__ == "__main__":
